@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
-    # Deployment workflow_run hanya berjalan jika Upstream Sync berhasil.
+    # Saat dipicu oleh Upstream Sync, deploy hanya jika workflow tersebut berhasil.
     if: >
       github.event_name != 'workflow_run' ||
       github.event.workflow_run.conclusion == 'success'
@@ -47,7 +47,7 @@ jobs:
           fetch-depth: 1
 
       # ============================================================
-      # 2. Instal pnpm dan Node.js
+      # 2. Instal pnpm
       # ============================================================
       - name: Install pnpm
         uses: pnpm/action-setup@v5
@@ -55,14 +55,62 @@ jobs:
           version: 10
           run_install: false
 
+      # ============================================================
+      # 3. Instal Node.js dan aktifkan pnpm cache
+      # Lockfile berada di worker dan frontend, bukan di root.
+      # ============================================================
       - name: Install Node.js
         uses: actions/setup-node@v6
         with:
           node-version: 24
           cache: pnpm
+          cache-dependency-path: |
+            worker/pnpm-lock.yaml
+            frontend/pnpm-lock.yaml
 
       # ============================================================
-      # 3. Validasi secret wajib
+      # 4. Validasi struktur repository
+      # ============================================================
+      - name: Validate repository structure
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          required_files=(
+            "worker/package.json"
+            "worker/pnpm-lock.yaml"
+            "worker/src/worker.ts"
+          )
+
+          validation_failed=false
+
+          for file in "${required_files[@]}"; do
+            if [[ ! -f "$file" ]]; then
+              echo "::error::File wajib tidak ditemukan: $file"
+              validation_failed=true
+            fi
+          done
+
+          if [[ "$validation_failed" == "true" ]]; then
+            exit 1
+          fi
+
+          if [[ "${USE_WORKER_ASSETS:-false}" == "true" ]]; then
+            if [[ ! -f "frontend/package.json" ]]; then
+              echo "::error::frontend/package.json tidak ditemukan."
+              exit 1
+            fi
+
+            if [[ ! -f "frontend/pnpm-lock.yaml" ]]; then
+              echo "::error::frontend/pnpm-lock.yaml tidak ditemukan."
+              exit 1
+            fi
+          fi
+
+          echo "Struktur repository valid."
+
+      # ============================================================
+      # 5. Validasi GitHub Secrets wajib
       # ============================================================
       - name: Validate required secrets
         shell: bash
@@ -98,7 +146,8 @@ jobs:
           echo "Semua secret wajib tersedia."
 
       # ============================================================
-      # 4. Build frontend jika dimasukkan ke Worker Assets
+      # 6. Build frontend normal
+      # Hanya berjalan jika USE_WORKER_ASSETS=true.
       # ============================================================
       - name: Build normal frontend assets
         if: env.USE_WORKER_ASSETS == 'true' && env.USE_WORKER_ASSETS_WITH_TELEGRAM != 'true'
@@ -114,12 +163,21 @@ jobs:
           pnpm build:pages
 
           if [[ ! -d "dist" ]]; then
-            echo "::error::Folder frontend/dist tidak ditemukan setelah build."
+            echo "::error::Folder frontend/dist tidak ditemukan setelah proses build."
+            exit 1
+          fi
+
+          if [[ -z "$(find dist -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+            echo "::error::Folder frontend/dist kosong."
             exit 1
           fi
 
           echo "Normal frontend assets berhasil dibuat."
 
+      # ============================================================
+      # 7. Build frontend Telegram
+      # Hanya berjalan jika kedua secret bernilai true.
+      # ============================================================
       - name: Build Telegram frontend assets
         if: env.USE_WORKER_ASSETS == 'true' && env.USE_WORKER_ASSETS_WITH_TELEGRAM == 'true'
         shell: bash
@@ -134,14 +192,19 @@ jobs:
           pnpm build:telegram:pages
 
           if [[ ! -d "dist" ]]; then
-            echo "::error::Folder frontend/dist tidak ditemukan setelah build."
+            echo "::error::Folder frontend/dist tidak ditemukan setelah proses build."
+            exit 1
+          fi
+
+          if [[ -z "$(find dist -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+            echo "::error::Folder frontend/dist kosong."
             exit 1
           fi
 
           echo "Telegram frontend assets berhasil dibuat."
 
       # ============================================================
-      # 5. Buat worker/wrangler.toml dari GitHub Secret
+      # 8. Buat worker/wrangler.toml dari secret BACKEND_TOML
       # ============================================================
       - name: Create Wrangler configuration
         shell: bash
@@ -156,10 +219,10 @@ jobs:
             exit 1
           fi
 
-          # Hanya pemilik proses yang dapat membaca file.
+          # Membatasi izin baca file hanya untuk pengguna saat ini.
           umask 077
 
-          # Menulis konfigurasi tanpa mengeksekusi karakter khusus Shell.
+          # Menulis konfigurasi tanpa menjalankan karakter khusus Shell.
           printf '%s\n' "$WRANGLER_TOML_CONTENT" > wrangler.toml
 
           if [[ ! -s "wrangler.toml" ]]; then
@@ -167,7 +230,7 @@ jobs:
             exit 1
           fi
 
-          # Validasi beberapa field dasar tanpa menampilkan isi secret.
+          # Validasi konfigurasi dasar tanpa menampilkan isi secret.
           if ! grep -Eq '^[[:space:]]*name[[:space:]]*=' wrangler.toml; then
             echo "::error::BACKEND_TOML tidak memiliki konfigurasi 'name'."
             exit 1
@@ -183,10 +246,35 @@ jobs:
             exit 1
           fi
 
+          if ! grep -Eq '^[[:space:]]*\[\[d1_databases\]\]' wrangler.toml; then
+            echo "::warning::Binding D1 tidak ditemukan dalam BACKEND_TOML."
+          fi
+
           echo "worker/wrangler.toml berhasil dibuat dan divalidasi."
 
       # ============================================================
-      # 6. Instal dependensi backend
+      # 9. Pastikan konfigurasi assets sesuai
+      # ============================================================
+      - name: Validate Worker assets configuration
+        shell: bash
+        working-directory: worker
+        run: |
+          set -Eeuo pipefail
+
+          if grep -Eq '^[[:space:]]*\[assets\]' wrangler.toml; then
+            echo "Konfigurasi Worker Assets ditemukan."
+
+            if [[ ! -d "../frontend/dist" ]]; then
+              echo "::error::BACKEND_TOML memakai [assets], tetapi frontend/dist belum tersedia."
+              echo "::error::Atur USE_WORKER_ASSETS=true atau hapus bagian [assets] dari BACKEND_TOML."
+              exit 1
+            fi
+          else
+            echo "Deployment backend tanpa Worker Assets."
+          fi
+
+      # ============================================================
+      # 10. Instal dependensi backend
       # ============================================================
       - name: Install backend dependencies
         shell: bash
@@ -200,7 +288,7 @@ jobs:
           echo "Backend dependencies berhasil dipasang."
 
       # ============================================================
-      # 7. Instal parser WASM opsional
+      # 11. Konfigurasi mail parser WASM opsional
       # ============================================================
       - name: Configure WASM mail parser
         if: env.BACKEND_USE_MAIL_WASM_PARSER == 'true'
@@ -223,16 +311,34 @@ jobs:
             git apply "$PATCH_FILE"
             echo "Patch mail-parser-wasm-worker berhasil diterapkan."
           elif git apply --reverse --check "$PATCH_FILE"; then
-            echo "Patch mail-parser-wasm-worker sudah diterapkan sebelumnya."
+            echo "Patch mail-parser-wasm-worker sudah diterapkan."
           else
             echo "::error::Patch mail-parser-wasm-worker tidak dapat diterapkan."
             exit 1
           fi
 
       # ============================================================
-      # 8. Validasi konfigurasi dan build Worker
+      # 12. Tampilkan versi tool
       # ============================================================
-      - name: Validate Worker configuration
+      - name: Display tool versions
+        shell: bash
+        working-directory: worker
+        run: |
+          set -Eeuo pipefail
+
+          echo "Node.js version:"
+          node --version
+
+          echo "pnpm version:"
+          pnpm --version
+
+          echo "Wrangler version:"
+          pnpm exec wrangler --version
+
+      # ============================================================
+      # 13. Validasi build Worker dengan dry run
+      # ============================================================
+      - name: Validate Worker build
         shell: bash
         working-directory: worker
         env:
@@ -244,10 +350,10 @@ jobs:
           echo "Running Wrangler dry-run build..."
           pnpm run build
 
-          echo "Worker configuration dan build berhasil divalidasi."
+          echo "Worker build berhasil divalidasi."
 
       # ============================================================
-      # 9. Deploy ke Cloudflare
+      # 14. Deploy Worker ke Cloudflare
       # ============================================================
       - name: Deploy Cloudflare Worker
         shell: bash
@@ -260,13 +366,13 @@ jobs:
 
           echo "Deploying Cloudflare Worker..."
 
-          # Jangan sembunyikan output agar error Wrangler terlihat.
+          # Output tidak disembunyikan supaya error Wrangler terlihat.
           pnpm run deploy
 
           echo "Cloudflare Worker berhasil di-deploy."
 
       # ============================================================
-      # 10. Bersihkan file konfigurasi sementara
+      # 15. Bersihkan konfigurasi sementara
       # ============================================================
       - name: Remove temporary Wrangler configuration
         if: always()
@@ -276,7 +382,7 @@ jobs:
           echo "Temporary Wrangler configuration removed."
 
       # ============================================================
-      # 11. Ringkasan deployment
+      # 16. Ringkasan deployment
       # ============================================================
       - name: Deployment summary
         if: success()
@@ -285,8 +391,29 @@ jobs:
           {
             echo "## Backend Deployment"
             echo ""
-            echo "Status: berhasil"
-            echo "Repository: $GITHUB_REPOSITORY"
-            echo "Commit: $GITHUB_SHA"
-            echo "Triggered by: $GITHUB_EVENT_NAME"
+            echo "- Status: berhasil"
+            echo "- Repository: \`${GITHUB_REPOSITORY}\`"
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Trigger: \`${GITHUB_EVENT_NAME}\`"
+            echo "- Worker assets: \`${USE_WORKER_ASSETS:-false}\`"
+            echo "- Telegram assets: \`${USE_WORKER_ASSETS_WITH_TELEGRAM:-false}\`"
+            echo "- WASM parser: \`${BACKEND_USE_MAIL_WASM_PARSER:-false}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ============================================================
+      # 17. Ringkasan kegagalan
+      # ============================================================
+      - name: Failure summary
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo "## Backend Deployment"
+            echo ""
+            echo "- Status: gagal"
+            echo "- Repository: \`${GITHUB_REPOSITORY}\`"
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Trigger: \`${GITHUB_EVENT_NAME}\`"
+            echo ""
+            echo "Periksa langkah yang berwarna merah pada log GitHub Actions."
           } >> "$GITHUB_STEP_SUMMARY"
