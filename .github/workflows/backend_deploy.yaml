@@ -2,82 +2,291 @@ name: Deploy Backend
 
 on:
   workflow_run:
-    workflows: [Upstream Sync]
-    types: [completed]
+    workflows:
+      - Upstream Sync
+    types:
+      - completed
+
   push:
     tags:
       - "*"
+
   workflow_dispatch:
+
+concurrency:
+  group: deploy-backend-${{ github.repository }}
+  cancel-in-progress: false
 
 jobs:
   deploy:
+    name: Deploy Cloudflare Worker
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # Deployment workflow_run hanya berjalan jika Upstream Sync berhasil.
+    if: >
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+
     permissions:
-      contents: write
+      contents: read
+
+    env:
+      USE_WORKER_ASSETS: ${{ secrets.USE_WORKER_ASSETS }}
+      USE_WORKER_ASSETS_WITH_TELEGRAM: ${{ secrets.USE_WORKER_ASSETS_WITH_TELEGRAM }}
+      BACKEND_USE_MAIL_WASM_PARSER: ${{ secrets.BACKEND_USE_MAIL_WASM_PARSER }}
+
     steps:
-      - name: Checkout
+      # ============================================================
+      # 1. Checkout repository
+      # ============================================================
+      - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 1
+
+      # ============================================================
+      # 2. Instal pnpm dan Node.js
+      # ============================================================
+      - name: Install pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 10
+          run_install: false
 
       - name: Install Node.js
         uses: actions/setup-node@v6
         with:
           node-version: 24
+          cache: pnpm
 
-      - uses: pnpm/action-setup@v5
-        name: Install pnpm
-        id: pnpm-install
-        with:
-          version: 10
-          run_install: false
-
-      - name: Deploy Backend for ${{ github.ref_name }}
-        run: |
-          export use_worker_assets=${{ secrets.USE_WORKER_ASSETS }}
-          export use_worker_assets_with_telegram=${{ secrets.USE_WORKER_ASSETS_WITH_TELEGRAM }}
-          
-          if [ -n "$use_worker_assets" ]; then
-            cd frontend/
-            pnpm install --no-frozen-lockfile
-            if [ -n "$use_worker_assets_with_telegram" ]; then
-              echo "Building with telegram pages"
-              pnpm build:telegram:pages
-            else
-              echo "Building with normal pages"
-              pnpm build:pages
-            fi
-            cd ..
-          fi
-
-          export debug_mode=${{ secrets.DEBUG_MODE }}
-          export use_mail_wasm_parser=${{ secrets.BACKEND_USE_MAIL_WASM_PARSER }}
-          
-          cd worker/
-          # ✅ 修复核心：使用环境变量写入，避免 Shell 解析特殊字符
-          printf '%s\n' "$WRANGLER_TOML_CONTENT" > wrangler.toml
-          
-          pnpm install --no-frozen-lockfile
-
-          if [ -n "$use_mail_wasm_parser" ]; then
-            echo "Using mail-parser-wasm-worker"
-            pnpm add mail-parser-wasm-worker
-            git apply ../.github/config/mail-parser-wasm-worker.patch
-            echo "Applied mail-parser-wasm-worker patch"
-          fi
-
-          if [ "$debug_mode" = "true" ]; then
-            pnpm run deploy
-          else
-            if pnpm run deploy >/dev/null 2>&1; then
-              echo "Deploy succeeded"
-            else
-              code=$?
-              echo "Command failed with exit code $code"
-              exit "$code"
-            fi
-          fi
-          echo "Deployed for tag ${{ github.ref_name }}"
+      # ============================================================
+      # 3. Validasi secret wajib
+      # ============================================================
+      - name: Validate required secrets
+        shell: bash
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          # ✅ 将 secret 映射到环境变量中
           WRANGLER_TOML_CONTENT: ${{ secrets.BACKEND_TOML }}
+        run: |
+          set -Eeuo pipefail
+
+          validation_failed=false
+
+          if [[ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]]; then
+            echo "::error::Secret CLOUDFLARE_ACCOUNT_ID belum diatur atau kosong."
+            validation_failed=true
+          fi
+
+          if [[ -z "${CLOUDFLARE_API_TOKEN:-}" ]]; then
+            echo "::error::Secret CLOUDFLARE_API_TOKEN belum diatur atau kosong."
+            validation_failed=true
+          fi
+
+          if [[ -z "${WRANGLER_TOML_CONTENT:-}" ]]; then
+            echo "::error::Secret BACKEND_TOML belum diatur atau kosong."
+            validation_failed=true
+          fi
+
+          if [[ "$validation_failed" == "true" ]]; then
+            echo "::error::Deployment dihentikan karena secret wajib belum lengkap."
+            exit 1
+          fi
+
+          echo "Semua secret wajib tersedia."
+
+      # ============================================================
+      # 4. Build frontend jika dimasukkan ke Worker Assets
+      # ============================================================
+      - name: Build normal frontend assets
+        if: env.USE_WORKER_ASSETS == 'true' && env.USE_WORKER_ASSETS_WITH_TELEGRAM != 'true'
+        shell: bash
+        working-directory: frontend
+        run: |
+          set -Eeuo pipefail
+
+          echo "Installing frontend dependencies..."
+          pnpm install --no-frozen-lockfile
+
+          echo "Building normal frontend pages..."
+          pnpm build:pages
+
+          if [[ ! -d "dist" ]]; then
+            echo "::error::Folder frontend/dist tidak ditemukan setelah build."
+            exit 1
+          fi
+
+          echo "Normal frontend assets berhasil dibuat."
+
+      - name: Build Telegram frontend assets
+        if: env.USE_WORKER_ASSETS == 'true' && env.USE_WORKER_ASSETS_WITH_TELEGRAM == 'true'
+        shell: bash
+        working-directory: frontend
+        run: |
+          set -Eeuo pipefail
+
+          echo "Installing frontend dependencies..."
+          pnpm install --no-frozen-lockfile
+
+          echo "Building Telegram frontend pages..."
+          pnpm build:telegram:pages
+
+          if [[ ! -d "dist" ]]; then
+            echo "::error::Folder frontend/dist tidak ditemukan setelah build."
+            exit 1
+          fi
+
+          echo "Telegram frontend assets berhasil dibuat."
+
+      # ============================================================
+      # 5. Buat worker/wrangler.toml dari GitHub Secret
+      # ============================================================
+      - name: Create Wrangler configuration
+        shell: bash
+        working-directory: worker
+        env:
+          WRANGLER_TOML_CONTENT: ${{ secrets.BACKEND_TOML }}
+        run: |
+          set -Eeuo pipefail
+
+          if [[ -z "${WRANGLER_TOML_CONTENT:-}" ]]; then
+            echo "::error::Secret BACKEND_TOML kosong."
+            exit 1
+          fi
+
+          # Hanya pemilik proses yang dapat membaca file.
+          umask 077
+
+          # Menulis konfigurasi tanpa mengeksekusi karakter khusus Shell.
+          printf '%s\n' "$WRANGLER_TOML_CONTENT" > wrangler.toml
+
+          if [[ ! -s "wrangler.toml" ]]; then
+            echo "::error::worker/wrangler.toml gagal dibuat atau kosong."
+            exit 1
+          fi
+
+          # Validasi beberapa field dasar tanpa menampilkan isi secret.
+          if ! grep -Eq '^[[:space:]]*name[[:space:]]*=' wrangler.toml; then
+            echo "::error::BACKEND_TOML tidak memiliki konfigurasi 'name'."
+            exit 1
+          fi
+
+          if ! grep -Eq '^[[:space:]]*main[[:space:]]*=' wrangler.toml; then
+            echo "::error::BACKEND_TOML tidak memiliki konfigurasi 'main'."
+            exit 1
+          fi
+
+          if ! grep -Eq '^[[:space:]]*compatibility_date[[:space:]]*=' wrangler.toml; then
+            echo "::error::BACKEND_TOML tidak memiliki 'compatibility_date'."
+            exit 1
+          fi
+
+          echo "worker/wrangler.toml berhasil dibuat dan divalidasi."
+
+      # ============================================================
+      # 6. Instal dependensi backend
+      # ============================================================
+      - name: Install backend dependencies
+        shell: bash
+        working-directory: worker
+        run: |
+          set -Eeuo pipefail
+
+          echo "Installing backend dependencies..."
+          pnpm install --no-frozen-lockfile
+
+          echo "Backend dependencies berhasil dipasang."
+
+      # ============================================================
+      # 7. Instal parser WASM opsional
+      # ============================================================
+      - name: Configure WASM mail parser
+        if: env.BACKEND_USE_MAIL_WASM_PARSER == 'true'
+        shell: bash
+        working-directory: worker
+        run: |
+          set -Eeuo pipefail
+
+          PATCH_FILE="../.github/config/mail-parser-wasm-worker.patch"
+
+          if [[ ! -f "$PATCH_FILE" ]]; then
+            echo "::error::Patch tidak ditemukan: $PATCH_FILE"
+            exit 1
+          fi
+
+          echo "Installing mail-parser-wasm-worker..."
+          pnpm add mail-parser-wasm-worker
+
+          if git apply --check "$PATCH_FILE"; then
+            git apply "$PATCH_FILE"
+            echo "Patch mail-parser-wasm-worker berhasil diterapkan."
+          elif git apply --reverse --check "$PATCH_FILE"; then
+            echo "Patch mail-parser-wasm-worker sudah diterapkan sebelumnya."
+          else
+            echo "::error::Patch mail-parser-wasm-worker tidak dapat diterapkan."
+            exit 1
+          fi
+
+      # ============================================================
+      # 8. Validasi konfigurasi dan build Worker
+      # ============================================================
+      - name: Validate Worker configuration
+        shell: bash
+        working-directory: worker
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+
+          echo "Running Wrangler dry-run build..."
+          pnpm run build
+
+          echo "Worker configuration dan build berhasil divalidasi."
+
+      # ============================================================
+      # 9. Deploy ke Cloudflare
+      # ============================================================
+      - name: Deploy Cloudflare Worker
+        shell: bash
+        working-directory: worker
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+
+          echo "Deploying Cloudflare Worker..."
+
+          # Jangan sembunyikan output agar error Wrangler terlihat.
+          pnpm run deploy
+
+          echo "Cloudflare Worker berhasil di-deploy."
+
+      # ============================================================
+      # 10. Bersihkan file konfigurasi sementara
+      # ============================================================
+      - name: Remove temporary Wrangler configuration
+        if: always()
+        shell: bash
+        run: |
+          rm -f worker/wrangler.toml
+          echo "Temporary Wrangler configuration removed."
+
+      # ============================================================
+      # 11. Ringkasan deployment
+      # ============================================================
+      - name: Deployment summary
+        if: success()
+        shell: bash
+        run: |
+          {
+            echo "## Backend Deployment"
+            echo ""
+            echo "Status: berhasil"
+            echo "Repository: $GITHUB_REPOSITORY"
+            echo "Commit: $GITHUB_SHA"
+            echo "Triggered by: $GITHUB_EVENT_NAME"
+          } >> "$GITHUB_STEP_SUMMARY"
